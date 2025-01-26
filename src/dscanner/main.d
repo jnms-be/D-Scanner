@@ -27,6 +27,7 @@ import dscanner.ctags;
 import dscanner.etags;
 import dscanner.astprinter;
 import dscanner.imports;
+import dscanner.imported_symbols;
 import dscanner.outliner;
 import dscanner.symbol_finder;
 import dscanner.analysis.run;
@@ -57,6 +58,10 @@ else
 	bool ast;
 	bool imports;
 	bool recursiveImports;
+	bool importedSymbols;
+	string versions;
+	bool debugMode;
+	string debugVersions;
 	bool muffin;
 	bool outline;
 	bool tokenDump;
@@ -97,6 +102,10 @@ else
 				"ast|xml", &ast,
 				"imports|i", &imports,
 				"recursiveImports", &recursiveImports,
+				"importedSymbols", &importedSymbols,
+				"versions", &versions,
+				"debugMode", &debugMode,
+				"debugVersions", &debugVersions,
 				"outline|o", &outline,
 				"tokenDump", &tokenDump,
 				"styleCheck|S", &styleCheck,
@@ -242,6 +251,7 @@ else
 			syntaxCheck, ast, imports, outline, tokenDump, styleCheck,
 			defaultConfig, report, autofix, resolveMessage.length,
 			symbolName !is null, etags, etagsAll, recursiveImports,
+			importedSymbols,
 	]);
 	if (optionCount > 1)
 	{
@@ -389,6 +399,10 @@ else
 		{
 			printImports(usingStdin, args, importPaths, &cache, recursiveImports);
 		}
+		else if (importedSymbols)
+		{
+			printImportedSymbols(args, versions.length > 0, versions, debugMode, debugVersions, &cache);
+		}
 		else if (ast || outline)
 		{
 			string fileName = usingStdin ? "stdin" : args[1];
@@ -468,6 +482,19 @@ Options:
         Specify that the given directory should be searched for imported
         modules. This option can be passed multiple times to specify multiple
         directories.
+
+    --importedSymbols <file>
+        Similar to "--imports", but lists all imported symbols instead of modules.
+
+    --versions <identifiers,...>
+        Comma separated list of identifiers enabled for --importedSymbols.
+        When unspecified, version conditions are ignored.
+
+    --debugMode
+        Makes --importedSymbols also include code in debug conditions.
+        
+    --debugVersions <identifiers,...>
+        Makes --importedSymbols also include code in debug (<identifier>) conditions.
 
     --exclude <file | directory>..., <file | directory>
         Specify files or directories that will be ignored by D-Scanner.
