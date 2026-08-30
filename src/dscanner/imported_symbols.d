@@ -15,6 +15,16 @@ import std.meta : AliasSeq;
 import std.stdio : writefln, writeln;
 import std.typecons : Rebindable;
 
+version (unittest)
+{
+	import std.algorithm : equal, sort;
+	import std.array : array;
+	import std.file : deleteme, mkdir, rmdirRecurse;
+	import std.path : buildPath;
+	import std.stdio : File;
+	import std.string : strip;
+}
+
 void printImportedSymbols(
 	string[] args,
 	in bool useVersions, in string versionsCommaSeparated,
@@ -325,4 +335,64 @@ in (fqSymbols !is null)
 		}
 	};
 	visitor.visit(module_);
+}
+
+@("")
+unittest
+{
+	string dirPath = deleteme;
+	scope (exit) dirPath.rmdirRecurse;
+	dirPath.mkdir;
+
+	string filePath = buildPath(dirPath, "example.d");
+	File(filePath, "w").write(strip(`
+module example;
+
+private import mod1;
+public import mod2 : sym2;
+static import mod3;
+
+import mod4 : sym4;
+import mod5;
+import mod5
+:sym5;
+import mod6, mod6 : sym6, mod6.submod : sym6, mod6.submod;
+
+template A(T)
+{
+	import mod7;
+	alias A = T;
+}
+
+mixin template B(T)
+{
+	import mod8;
+	alias B = T;
+}
+
+version (none)
+{
+	import mod9;
+}
+	`));
+
+	auto result = new RedBlackTree!string;
+	visitFile(
+		fileName: filePath,
+		useVersions: false, versions: new RedBlackTree!string,
+		useDebugVersions: false, debugVersions: new RedBlackTree!string,
+		allImportedSymbols: result,
+		stringCache: new StringCache(StringCache.defaultBucketCount),
+	);
+	assert(result[].array.sort.equal([
+		"mod1.*",
+		"mod2.sym2",
+		"mod4.sym4",
+		"mod5.*",
+		"mod5.sym5",
+		// "mod6.*", "mod6.submod.*", "mod6.submod.sym6", "mod6.sym6", // FIXME should appear
+		"mod7.*",
+		"mod8.*", // FIXME should not appear
+		"mod9.*", // version (none) code appears with useVersions:false
+	]));
 }
