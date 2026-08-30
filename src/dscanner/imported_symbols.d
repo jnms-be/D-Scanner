@@ -17,7 +17,8 @@ import std.typecons : Rebindable;
 
 void printImportedSymbols(
 	string[] args,
-	in bool useVersions, in string versionsCommaSeparated, in bool useDebugVersions, in string debugVersionsCommaSeparated,
+	in bool useVersions, in string versionsCommaSeparated,
+	in bool useDebugVersions, in string debugVersionsCommaSeparated,
 	StringCache* cache,
 )
 {
@@ -33,7 +34,8 @@ private:
 
 void visitFile(
 	in string fileName,
-	in bool useVersions, in RedBlackTree!string versions, in bool useDebugVersions, in RedBlackTree!string debugVersions,
+	in bool useVersions, in RedBlackTree!string versions,
+	in bool useDebugVersions, in RedBlackTree!string debugVersions,
 	RedBlackTree!string allImportedSymbols,
 	StringCache* stringCache,
 )
@@ -66,7 +68,8 @@ void visitFile(
 
 void analyze(
 	in Module module_,
-	in bool useVersions, in RedBlackTree!string versions, in bool useDebugVersions, in RedBlackTree!string debugVersions,
+	in bool useVersions, in RedBlackTree!string versions,
+	in bool useDebugVersions, in RedBlackTree!string debugVersions,
 	RedBlackTree!string fqSymbols,
 )
 in (module_ !is null)
