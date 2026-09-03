@@ -1,6 +1,7 @@
 module dscanner.imported_symbols_v2;
 
 import dparse.ast;
+import dparse.astprinter;
 import dparse.lexer;
 import dparse.parser : parseModule, ParserConfig;
 import dparse.rollback_allocator : RollbackAllocator;
@@ -10,22 +11,22 @@ import std.algorithm;
 import std.container.rbtree;
 import std.container.slist;
 import std.conv : to;
+import std.exception : assumeWontThrow;
 import std.file : readText;
 import std.format : f = format;
 import std.meta;
 import std.range;
 import std.stdio : write, writef, writefln, writeln;
-import std.string : representation, strip;
+import std.string : representation, strip, assumeUTF;
+import std.sumtype;
 import std.traits;
+
+// TODO: Handling of version else-clause
+// TODO: Don't emit static if's that reference template arguments (but process their contents).
 
 // Note that "version = ..." declarations naturally work fine with this.
 
 @safe:
-
-struct Imports
-{
-	Import[Requirements] byRequirements;
-}
 
 struct Import
 {
@@ -69,13 +70,6 @@ struct Requirements
 	string[] staticIfs;
 }
 
-enum RequirementKind
-{
-	version_,
-	debugSpec,
-	staticIf,
-}
-
 Import[][Requirements] listImportsByRequirements(
 	in ubyte[] sourceCode,
 	StringCache* stringCache = null,
@@ -100,10 +94,11 @@ Import[][Requirements] listImportsByRequirements(
 		));
 	}();
 
+
 	Import[][Requirements] importsByRequirements;
 
 	() @trusted {
-		Visitor visitor = new Visitor(BaseAnalyzerArguments.init);
+		Visitor visitor = new Visitor(BaseAnalyzerArguments.init, sourceCode);
 		visitor.visit(module_);
 		importsByRequirements = visitor.m_importsByRequirements;
 	}();
@@ -116,71 +111,76 @@ class Visitor : ScopedBaseAnalyzer
 {
 	alias visit = typeof(super).visit;
 
+	const(ubyte)[] m_sourceCode;
 	Import[][Requirements] m_importsByRequirements;
 
 	Requirements m_requirements;
-	bool m_attrStatic;
-	string m_visibility;
-	string m_visibilityPackage;
+	Attributes m_attributes;
+	Attributes[] m_attributesScopeStack; /// See `pushScope` and `popScope`.
 
-	this(BaseAnalyzerArguments args)
+	this(BaseAnalyzerArguments args, const(ubyte)[] sourceCode)
 	{
 		super(args);
+		m_sourceCode = sourceCode;
 	}
 
-	protected override
-	void pushScope()
-	{
-	}
-
-	protected override
-	void popScope()
-	{
-	}
+	//
+	// Tracking of m_requirements
+	//
 
 	auto evaluateCondition(const CompileCondition node)
 	{
+		alias Condition = SumType!(const VersionCondition, const DebugCondition, const StaticIfCondition);
 		struct RaiiEffect
 		{
 			Visitor m_visitor;
-			RequirementKind m_kind;
+			Condition m_condition;
 
 			@disable this();
 			@disable this(scope ref typeof(this));
 
-			this(Visitor visitor, RequirementKind kind, string value)
+			this(Visitor visitor, in typeof(m_condition) condition)
 			{
 				m_visitor = visitor;
-				m_kind = kind;
-				final switch (m_kind)
-				{
-				case RequirementKind.version_:  m_visitor.m_requirements.versions ~= value;   break;
-				case RequirementKind.debugSpec: m_visitor.m_requirements.debugSpecs ~= value; break;
-				case RequirementKind.staticIf:  m_visitor.m_requirements.staticIfs ~= value;  break;
-				}
+				m_condition = condition;
+				
+				m_condition.match!(
+					(in VersionCondition c) {
+						m_visitor.m_requirements.versions
+							~= c.token.tokenTo!string;
+					},
+					(in DebugCondition c) {
+						m_visitor.m_requirements.debugSpecs
+							~= c.identifierOrInteger.tokenTo!string;
+					},
+					(in StaticIfCondition c) {
+						m_visitor.m_requirements.staticIfs
+							~= c.assignExpression.tokens.tokensTo!string(m_visitor.m_sourceCode);
+				},
+				);
 			}
 
 			~this()
 			{
-				final switch (m_kind)
-				{
-				case RequirementKind.version_:  m_visitor.m_requirements.versions.popFront;   break;
-				case RequirementKind.debugSpec: m_visitor.m_requirements.debugSpecs.popFront; break;
-				case RequirementKind.staticIf:  m_visitor.m_requirements.staticIfs.popFront;  break;
-				}
+				m_condition.match!(
+					(in VersionCondition _) => m_visitor.m_requirements.versions.popFront,
+					(in DebugCondition _) => m_visitor.m_requirements.debugSpecs.popFront,
+					(in StaticIfCondition _) => m_visitor.m_requirements.staticIfs.popFront,
+				);
 			}
 		}
 		
 		if (node.versionCondition !is null)
-			return RaiiEffect(this, RequirementKind.version_, node.versionCondition.token.text);
+			return RaiiEffect(this, Condition(node.versionCondition));
 		else if (node.debugCondition !is null)
-			return RaiiEffect(this, RequirementKind.debugSpec, node.debugCondition.identifierOrInteger.text);
+			return RaiiEffect(this, Condition(node.debugCondition));
 		else if (node.staticIfCondition !is null)
-			return RaiiEffect(this, RequirementKind.version_, node.staticIfCondition.assignExpression.tokens.to!string);
+			return RaiiEffect(this, Condition(node.staticIfCondition));
 		else
 			assert(false);
 	}
 
+	/// Visit the node's children with the requirement applied.
 	override
 	void visit(const ConditionalDeclaration node)
 	{
@@ -197,6 +197,7 @@ class Visitor : ScopedBaseAnalyzer
 		}
 	}
 
+	/// ditto
 	override
 	void visit(const ConditionalStatement node)
 	{
@@ -211,30 +212,70 @@ class Visitor : ScopedBaseAnalyzer
 		}
 	}
 
-	// Reset and restore m_attrStatic.
-	// TODO: what other scopes reset static on entry? templates?
+	//
+	// Tracking of m_attributes
+	//
+
+	enum string saveAttributesMixin = q{
+		const original = m_attributes;
+		scope (exit) m_attributes = original;
+	};
+
+	/// Attributes are reset when entering these.
 	static foreach (T; AliasSeq!(SpecifiedFunctionBody, StructBody))
 	{
 		override
 		void visit(const T node)
 		{
-			const bool original = m_attrStatic;
-			m_attrStatic = false;
-			scope (exit) m_attrStatic = original;
+			mixin(saveAttributesMixin);
+			m_attributes = Attributes.init;
 			super.visit(node);
 		}
 	}
 
+	/// Apply attributes on declarations.
 	override
 	void visit(const Declaration node)
 	{
-		// Subtree has static attribute, set m_attrStatic to true for subtree.
-		const bool original = m_attrStatic;
-		if (node.attributes.any!(a => a.attribute == tok!"static"))
-			m_attrStatic = true;
-		scope (exit) m_attrStatic = original;
+		mixin(saveAttributesMixin);
+		foreach (const attribute; node.attributes)
+			m_attributes.apply(attribute);
 		super.visit(node);
 	}
+
+	/// Apply `attribute:` syntax for the rest of the scope.
+	override
+	void visit(const AttributeDeclaration node)
+	{
+		m_attributes.apply(node.attribute);
+		super.visit(node);
+	}
+
+	/// See `visit(AttributeDeclaration)`.
+	override
+	void pushScope()
+	{
+		m_attributesScopeStack ~= m_attributes;
+	}
+
+	/// ditto
+	override
+	void popScope()
+	{
+		m_attributes = m_attributesScopeStack.front;
+		m_attributesScopeStack.popFront;
+	}
+
+	/// Skip mixin templates.
+	override
+	void visit(const MixinTemplateDeclaration node)
+	{
+		cast(void) node;
+	}
+
+	//
+	// Processing of imports
+	//
 
 	override
 	void visit(const ImportDeclaration node)
@@ -243,11 +284,11 @@ class Visitor : ScopedBaseAnalyzer
 		foreach (const SingleImport im; node.singleImports)
 		{
 			m_importsByRequirements[m_requirements] ~= Import(
-				fqModuleName: im.identifierChain.moduleIdentifierChainToString,
+				fqModuleName: im.identifierChain.identifierChainTo!string,
 				moduleRename: im.rename.text,
-				isStatic: im.rename.text.empty && m_attrStatic, // rename takes priority
-				visibility: m_visibility,
-				visibilityPackage: m_visibilityPackage,
+				isStatic: im.rename.text.empty && m_attributes.static_, // rename takes priority
+				visibility: m_attributes.visibility,
+				visibilityPackage: m_attributes.visibilityPackage,
 			);
 		}
 
@@ -256,7 +297,7 @@ class Visitor : ScopedBaseAnalyzer
 		if (node.importBindings !is null)
 		{
 			const SingleImport im = node.importBindings.singleImport;
-			const string fqModuleName = im.identifierChain.moduleIdentifierChainToString;
+			const string fqModuleName = im.identifierChain.identifierChainTo!string;
 			// This import can still be renamed, without affecting the symbols (bindings).
 			// Note that static never applies here.
 			if (im.rename.text.length)
@@ -264,8 +305,8 @@ class Visitor : ScopedBaseAnalyzer
 				m_importsByRequirements[m_requirements] ~= Import(
 					fqModuleName: fqModuleName,
 					moduleRename: im.rename.text,
-					visibility: m_visibility,
-					visibilityPackage: m_visibilityPackage,
+					visibility: m_attributes.visibility,
+					visibilityPackage: m_attributes.visibilityPackage,
 				);
 			}
 			foreach (const ImportBind bind; node.importBindings.importBinds)
@@ -276,8 +317,8 @@ class Visitor : ScopedBaseAnalyzer
 					// field, while `right` is empty.
 					symbolName: bind.right.text.length ? bind.right.text : bind.left.text,
 					symbolRename: bind.right.text.length ? bind.left.text : "",
-					visibility: m_visibility,
-					visibilityPackage: m_visibilityPackage,
+					visibility: m_attributes.visibility,
+					visibilityPackage: m_attributes.visibilityPackage,
 				);
 			}
 		}
@@ -285,47 +326,90 @@ class Visitor : ScopedBaseAnalyzer
 	}
 }
 
-pure
-string moduleIdentifierChainToString(const IdentifierChain identifierChain)
-	=> identifierChain.identifiers.map!(id => id.text).join(".");
+private
+enum RequirementKind
+{
+	version_,
+	debugSpec,
+	staticIf,
+}
+
+private
+struct Attributes
+{
+	bool static_;
+	string visibility;
+	string visibilityPackage;
+
+scope:
+pure nothrow:
+	void apply(in Attribute attribute)
+	{
+		switch (attribute.attribute.type)
+		{
+			case tok!"public":
+				visibility = "public";
+				visibilityPackage = "";
+				break;
+			case tok!"protected":
+				visibility = "protected";
+				visibilityPackage = "";
+				break;
+			case tok!"package":
+				visibility = "package";
+				visibilityPackage = attribute.identifierChain.identifierChainTo!string;
+				break;
+			case tok!"private":
+				visibility = "private";
+				visibilityPackage = "";
+				break;
+			case tok!"static":
+				static_ = true;
+				break;
+			default:
+				break;
+		}
+	}
+}
+
+private pure nothrow
+T identifierChainTo(T)(in IdentifierChain identifierChain)
+if (isSomeString!T)
+	=> identifierChain.identifiers.map!(id => id.text).join(".").to!T;
+
+private pure nothrow
+T tokenTo(T)(in Token token)
+if (isSomeString!T)
+	=> (token.text ? token.text : token.type.str).to!T;
+
+private pure nothrow
+T tokensTo(T)(in Token[] tokens, in ubyte[] sourceCode)
+if (isSomeString!T)
+{
+	if (tokens.empty)
+		return T.init;
+	size_t begin = tokens[0].index;
+	size_t end = tokens[$ - 1].index + tokens[$ - 1].tokenTo!string.representation.length;
+	if (sourceCode.length < end)
+		return T.init;
+	return sourceCode[begin .. end].assumeUTF.to!T;
+}
 
 @("")
 unittest
 {
-	///+
+	/+
 	const ubyte[] sourceCode = `
-module example;
-
-private import mod1 : a;
-public import mod2 : sym2;
-static import mod3;
-
-import mod4 : sym4;
-import mod5;
-import mod5
-:sym5;
-import mod6, mod6 : sym6, mod6.submod : sym6, mod6.submod;
-
-template A(T)
-{
-	import mod7;
-	alias A = T;
-}
-
-mixin template B(T)
-{
-	import mod8;
-	alias B = T;
-}
-
-version (none)
-{
-	import mod9;
-}
+             import mod1;
+private      import mod2;
+package(pkg) import mod3;
+package      import mod4;
+protected    import mod5;
+public       import mod6;
 	`.strip.representation;
-	//+/
+	+/
 
-	// const ubyte[] sourceCode = "/home/jnms/projects/dlang/ldc/runtime/phobos/std/sumtype.d".readText.strip.representation;
+	const ubyte[] sourceCode = "/home/jnms/projects/dlang/ldc/runtime/phobos/std/sumtype.d".readText.strip.representation;
 
 	const Import[][Requirements] importsByRequirements = listImportsByRequirements(
 		sourceCode: sourceCode,
@@ -334,13 +418,8 @@ version (none)
 
 	foreach (const Requirements reqs, const Import[] imports; importsByRequirements)
 	{
-		if (reqs.versions.empty)
-			writeln("version (all)");
-		else
-		{
-			foreach (version_; reqs.versions)
-				writefln!"version (%s)"(version_);
-		}
+		foreach (version_; reqs.versions)
+			writefln!"version (%s)"(version_);
 		foreach (debugSpec; reqs.debugSpecs)
 		{
 			if (debugSpec.empty)
@@ -349,7 +428,7 @@ version (none)
 				writefln!"debug (%s)"(debugSpec);
 		}
 		foreach (staticIf; reqs.staticIfs)
-			writefln!"version (%s)"(staticIf);
+			writefln!"static if (%s)"(staticIf);
 		writeln("private");
 		writeln("{");
 		foreach (Import im; imports)
@@ -362,7 +441,10 @@ version (none)
 				case "protected": // has the same effect as public
 					return "public";
 				case "package":
-					return f!"package(%s)"(im.visibilityPackage);
+					if (im.visibilityPackage.empty)
+					 	return "package";
+					else
+						return f!"package(%s)"(im.visibilityPackage);
 				case "private":
 				default:
 					return "";
@@ -392,17 +474,4 @@ version (none)
 		writeln("}");
 		writeln("");
 	}
-	/+
-	assert(result[].array.sort.equal([
-		"mod1.*",
-		"mod2.sym2",
-		"mod4.sym4",
-		"mod5.*",
-		"mod5.sym5",
-		// "mod6.*", "mod6.submod.*", "mod6.submod.sym6", "mod6.sym6", // FIXME should appear
-		"mod7.*",
-		"mod8.*", // FIXME should not appear
-		"mod9.*", // version (none) code appears with useVersions:false
-	]));
-	+/
 }
